@@ -1,0 +1,13 @@
+{
+  "DataChunks": [
+    {"fields": [["SourceDb", 1], ["TargetDb", 1], ["TableName", 1], ["StartId", 1], ["EndId", 1]], "unique": true},
+    {"fields": [["Status", 1]]},
+    {"fields": [["AssignedWorker", 1]]},
+    {"fields": [["LastProcessedId", 1]]}
+  ],
+  "ChangeLog": [
+    {"fields": [["SourceDb", 1], ["TargetDb", 1], ["TableName", 1]]},
+    {"fields": [["Processed", 1]]},
+    {"fields": [["Timestamp", 1]]}
+  ]
+}
