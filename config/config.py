@@ -3,7 +3,7 @@
 # ----------------------------
 # MongoDB Connection Settings
 # ----------------------------
-MongoUri = "mongodb://localhost:27017"   # MongoDB URI
+MongoUri = ""   # MongoDB URI
 MetaDb = "metadata"                       # Central metadata database
 
 # ----------------------------

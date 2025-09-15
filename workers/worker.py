@@ -4,6 +4,7 @@ import logging
 import time
 import signal
 import sys
+import certifi
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 import oracledb  # Replacing cx_Oracle with oracledb
@@ -34,7 +35,8 @@ class Worker:
     def __init__(self, worker_id: str, client: MongoClient = None):
         """Initialize the Worker with a unique ID and MongoDB client."""
         self.worker_id = worker_id
-        self.client = client or MongoClient(MongoUri)
+        self.client = client or MongoClient(MongoUri, tls=True,
+                        tlsCAFile=certifi.where())
         self.meta_db = self.client[MetaDb]
         self.data_chunks = self.meta_db[DataChunksCollection]
 

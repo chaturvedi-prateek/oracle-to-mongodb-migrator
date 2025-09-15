@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+<meta name="description" content="">
+<script src="https://kit.fontawesome.com/339a2625d9.js" crossorigin="anonymous"></script>
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script src="/community/static/get_data.js"></script>
+<link href="https://fonts.googleapis.com/css?family=Poppins:100,200,300,400,500,600,700,800,900" rel="stylesheet">
+<link rel="stylesheet" href="/community/static/chpstyle.css">
+
+<title>Page Not Found - MongoDB Community </title>
+
+    <!-- Render js for Navbar -->
+    <script type="module" src="/community/static/public/navbar.js"></script>
+
+    
+    <script src="/community/static/public/analytics.js"></script>
+    
+
+    <style>
+        body.landing-page footer {
+            background: #061621 !important;
+            color: #f9fbfa !important;
+        }
+
+        /* Patch for nav and children to be front of everything*/
+        .unified-nav {
+            position: relative;
+            z-index: 9999;
+        }
+    </style>
+    <link href='https://fonts.googleapis.com/css?family=Lexend Deca' rel='stylesheet'>
+    <link rel="icon" href="https://www.mongodb.com/assets/images/global/favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="https://www.mongodb.com/assets/images/global/favicon.ico">
+</head>
+
+<body>
+    <div id="___gatsby">
+        <div id="pencilBannerContainer" class="pencilbanner">
+            <a href="https://www.mongodb.com/events/mongodb-local?utm_campaign=devrel&utm_source=communityhome&utm_medium=cta&utm_term=banner.local.2025"
+                class="pencilbannerlink">
+                <div class="pencilbannertext">
+                    MongoDB.local is coming NYC, London and a city near you! Use code Community50 for 50% off your registration.
+                </div>
+            </a>
+            <span class="closebtn" onclick="closeBanner(event)">&times;</span>
+            <script>
+                function closeBanner(event) {
+                    document.getElementById("pencilBannerContainer").style.display = 'none';
+                }
+            </script>
+        </div>
+        <style>
+            .pencilbanner {
+                min-height: 40px;
+                background: rgb(17, 97, 73);
+                text-align: center;
+                display: flex;
+            }
+
+            .pencilbannertext {
+                margin: auto;
+                color: white;
+                font-family: Source Code Pro;
+                font-size: 15px;
+                padding: 5px;
+            }
+
+            .pencilbannerlink {
+                flex-grow: 2;
+            }
+
+            .closebtn {
+                font-size: 25px;
+                color: white;
+                cursor: pointer;
+                margin-right: 10px;
+                align-self: center;
+            }
+        </style>
+        <div id="mdbnav" class="unified-nav"></div>
+        <style>
+            .css-10f7tc {
+                position: sticky !important;
+
+            }
+
+            .sticky {
+                position: fixed;
+                top: 0;
+                width: 100%;
+            }
+        </style>
+        <script>
+            window.onscroll = function () { myFunction() };
+            var navbar = document.getElementById("mdbnav");
+            var sticky = navbar.offsetTop;
+            function myFunction() {
+                if (window.pageYOffset >= sticky) {
+                    navbar.classList.add("sticky")
+                } else {
+                    navbar.classList.remove("sticky");
+                }
+            }
+        </script>
+        <div style="outline:none" tabindex="-1" id="gatsby-focus-wrapper">
+            <style data-emotion="css scvaue">
+                .css-scvaue {
+                    display: -webkit-box;
+                    display: -webkit-flex;
+                    display: -ms-flexbox;
+                    display: flex;
+                    -webkit-flex-direction: column;
+                    -ms-flex-direction: column;
+                    flex-direction: column;
+                    -webkit-box-pack: justify;
+                    -webkit-justify-content: space-between;
+                    justify-content: space-between;
+                    min-height: 100vh;
+                    width: 100%;
+                }
+            </style>
+            <div class="css-scvaue e16uzoiv1">
+                <style data-emotion="css-global coegwl">
+                    html {
+                        box-sizing: border-box;
+                        height: 100%;
+                    }
+
+                    *,
+                    *::before,
+                    *::after {
+                        box-sizing: inherit;
+                    }
+
+                    body {
+                        color: #f9fbfa;
+                        background-color: #001E2B;
+                        font-family: 'Lexend Deca', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+                        font-size: 18px;
+                        line-height: 32px;
+                        margin: 0;
+                        padding: 0;
+                        background-image: url('/static/assets/forums.svg');
+                        background-position: center;
+                        background-position-y: -1500px;
+                        background-repeat: repeat;
+                        background-size: cover;
+                    }
+
+                    @media only screen and (max-width: 767px) {
+                        body {
+                            font-size: 16px;
+                            line-height: 24px;
+                        }
+                    }
+
+                    main>section {
+                        padding: 32px 120px;
+                    }
+
+                    @media only screen and (max-width: 1023px) {
+                        main>section {
+                            padding: 20px;
+                        }
+                    }
+
+                    img {
+                        max-width: 100%;
+                    }
+                </style>
+                <style data-emotion="css 1awe77t">
+                    .css-1awe77t {
+                        z-index: 22;
+                    }
+                </style>
+                <style data-emotion="css-global 5j4pxs">
+                    .css-5j4pxs {
+                        font-family: 'Lexend Deca' light;
+                    }
+                </style>
+                <style data-emotion="css-global 17v57cw">
+                    @font-face {
+                        font-family: Euclid Circular A;
+                        src: url(https://static.mongodb.com/com/fonts/EuclidCircularA-Regular-WebXL.woff2) format('woff2');
+                        font-weight: normal;
+                        font-display: swap;
+                    }
+
+                    @font-face {
+                        font-family: Euclid Circular A;
+                        src: url(https://static.mongodb.com/com/fonts/EuclidCircularA-Medium-WebXL.woff2) format('woff2');
+                        font-weight: 500;
+                        font-display: swap;
+                    }
+
+                    @font-face {
+                        font-family: MongoDB Value Serif;
+                        src: url(https://static.mongodb.com/com/fonts/MongoDBValueSerif-Regular.woff2) format('woff2');
+                        font-weight: normal;
+                        font-display: swap;
+                    }
+
+                    @font-face {
+                        font-family: MongoDB Value Serif;
+                        src: url(https://static.mongodb.com/com/fonts/MongoDBValueSerif-Medium.woff2) format('woff2');
+                        font-weight: 500;
+                        font-display: swap;
+                    }
+
+                    @font-face {
+                        font-family: MongoDB Value Serif;
+                        src: url(https://static.mongodb.com/com/fonts/MongoDBValueSerif-Bold.woff2) format('woff2');
+                        font-weight: bold;
+                        font-display: swap;
+                    }
+
+                    @font-face {
+                        font-family: Source Code Pro;
+                        src: url(https://static.mongodb.com/com/fonts/SourceCodePro-Regular.ttf) format('truetype');
+                        font-weight: normal;
+                        font-display: swap;
+                    }
+
+                    @font-face {
+                        font-family: Source Code Pro;
+                        src: url(https://static.mongodb.com/com/fonts/SourceCodePro-Medium.ttf) format('truetype');
+                        font-weight: 500;
+                        font-display: swap;
+                    }
+                </style>
+                <style data-emotion="css 7ybk3q">
+                    .css-7ybk3q {
+                        width: 100%;
+                        position: -webkit-sticky;
+                        position: sticky;
+                        top: 0;
+                        left: 0;
+                        z-index: 1;
+                        z-index: 22;
+                    }
+                </style>
+                <style data-emotion="css 15kcf6f">
+                    .css-15kcf6f {
+                        margin: 0 auto;
+                        max-width: 1440px;
+                        min-height: calc(100vh - 300px);
+                        width: 100%;
+                    }
+                </style>
+                <main class="css-15kcf6f e16uzoiv2">
+                    <style data-emotion="css 5fofuz">
+                        .css-5fofuz {
+                            padding: 16px 120px 64px;
+                        }
+
+                        @media only screen and (max-width: 1200px) {
+                            .css-5fofuz {
+                                padding: 24px 16px 64px;
+                            }
+                        }
+                    </style>
+                     
+<div class="error-container">
+    <div class="error-container">
+        <img class="error-image" src="https://mdb-community.s3.amazonaws.com/connect/common/error.png" alt="Error Image">
+        <div class="error-msg">
+          <h1>Oops! We can't find the page you were looking for.</h1>
+          <a href="https://www.mongodb.com/community">Go to MongoDB Community Homepage</a>
+        </div>
+      </div>
+
+                </main>
+                <div id="mdbfooter" class="unified-footer"></div>
+</body>
+
+</html>
