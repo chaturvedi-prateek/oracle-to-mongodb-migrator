@@ -13,10 +13,6 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Load MongoDB configuration from environment variables
-MongoUri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-MetadataDb = os.getenv("METADATA_DB", "metadata")
-
 # Constants for collection names
 DATA_CHUNKS_COLLECTION = "DataChunks"
 CHANGE_LOG_COLLECTION = "ChangeLog"
