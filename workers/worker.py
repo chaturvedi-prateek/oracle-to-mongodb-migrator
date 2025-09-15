@@ -6,16 +6,29 @@ import signal
 import sys
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
-import cx_Oracle  # or 'import oracledb' for the new driver
+import oracledb  # Replacing cx_Oracle with oracledb
 from bson import ObjectId
 from tenacity import retry, stop_after_attempt, wait_fixed
-from config.config import MongoUri, MetaDb, DatabaseMappings, DefaultBatchSize, MaxRetries, WorkerPollInterval
+from concurrent.futures import ThreadPoolExecutor
+from config.config import (
+    MongoUri, MetaDb, DatabaseMappings, DefaultBatchSize,
+    MaxRetries, WorkerPollInterval, MaxWorkerThreads
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Collection names
 DataChunksCollection = "DataChunks"
+
+# Signal handler for graceful shutdown
+def handle_exit(signal, frame):
+    logging.info("Worker shutting down gracefully...")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
 
 class Worker:
     def __init__(self, worker_id: str, client: MongoClient = None):
@@ -67,23 +80,25 @@ class Worker:
         start_id = chunk["StartId"]
         end_id = chunk["EndId"]
 
-        # Get Oracle connection details from DatabaseMappings
+        # Get Oracle connection info
         source_db_info = next((db for db in DatabaseMappings if db["SourceDb"] == source_db_name), None)
         if not source_db_info:
-            logging.error(f"Oracle DB info not found for {source_db_name}")
+            logging.error(f"No Oracle DB info for {source_db_name}")
             self.mark_chunk_failed(chunk["_id"])
             return
 
         try:
-            # Connect to Oracle
-            dsn = cx_Oracle.makedsn(
-                host=source_db_info["Dsn"].split(":")[0],
-                port=int(source_db_info["Dsn"].split(":")[1].split("/")[0]),
-                service_name=source_db_info["Dsn"].split("/")[1]
-            )
-            with cx_Oracle.connect(user=source_db_info["User"], password=source_db_info["Password"], dsn=dsn) as conn:
+            # Connect to Oracle using oracledb
+            with oracledb.connect(
+                user=source_db_info["User"],
+                password=source_db_info["Password"],
+                dsn=source_db_info["Dsn"]
+            ) as conn:
                 cursor = conn.cursor()
-                query = f"SELECT * FROM {table_name} WHERE ROWNUM BETWEEN :start_id AND :end_id"
+
+                # Use primary key for efficient chunking
+                pk_column = source_db_info.get("PrimaryKey", "ID")
+                query = f"SELECT * FROM {table_name} WHERE {pk_column} >= :start_id AND {pk_column} <= :end_id"
                 cursor.execute(query, {"start_id": start_id, "end_id": end_id})
                 rows = cursor.fetchall()
                 columns = [col[0] for col in cursor.description]
@@ -93,39 +108,58 @@ class Worker:
                 target_collection = target_db[table_name]
                 docs = [dict(zip(columns, row)) for row in rows]
                 if docs:
+                    start_time = time.time()
                     target_collection.insert_many(docs)
+                    duration = time.time() - start_time
+                    logging.info(f"Worker {self.worker_id} migrated {len(docs)} rows in {duration:.2f}s "
+                                 f"for {source_db_name}.{table_name} (StartId: {start_id}, EndId: {end_id})")
 
             self.mark_chunk_completed(chunk["_id"])
-            logging.info(f"Worker {self.worker_id} completed chunk {chunk['_id']} for {source_db_name}.{table_name} (StartId: {start_id}, EndId: {end_id}).")
 
         except Exception as e:
             logging.error(f"Worker {self.worker_id} failed chunk {chunk['_id']} for {source_db_name}.{table_name}: {e}")
             self.mark_chunk_failed(chunk["_id"])
 
-    def generate_summary_report(self, completed_chunks: int, failed_chunks: int):
-        """Generate a summary report of the chunks processed."""
-        logging.info(f"Summary: Worker {self.worker_id} processed {completed_chunks} chunks successfully and {failed_chunks} chunks failed.")
-
-    def run(self):
-        """Main loop to continuously pick and process chunks."""
-        logging.info(f"Worker {self.worker_id} started.")
-        completed_chunks = 0
-        failed_chunks = 0
+    def capture_cdc(self, table_name: str, source_db_name: str, target_db_name: str, last_sync_time: str):
+        """Poll Oracle for incremental changes since last_sync_time."""
+        source_db_info = next((db for db in DatabaseMappings if db["SourceDb"] == source_db_name), None)
+        if not source_db_info:
+            logging.error(f"No Oracle DB info for {source_db_name} in CDC")
+            return
 
         try:
-            while True:
-                chunk = self.assign_chunk()
-                if chunk:
-                    try:
-                        self.migrate_chunk(chunk)
-                        completed_chunks += 1
-                    except Exception:
-                        failed_chunks += 1
-                else:
-                    time.sleep(WorkerPollInterval)
-        except KeyboardInterrupt:
-            logging.info(f"Worker {self.worker_id} shutting down...")
-            self.generate_summary_report(completed_chunks, failed_chunks)
+            with oracledb.connect(
+                user=source_db_info["User"],
+                password=source_db_info["Password"],
+                dsn=source_db_info["Dsn"]
+            ) as conn:
+                cursor = conn.cursor()
+                query = f"SELECT * FROM {table_name} WHERE LAST_UPDATED > TO_TIMESTAMP(:last_sync_time, 'YYYY-MM-DD HH24:MI:SS')"
+                cursor.execute(query, {"last_sync_time": last_sync_time})
+                rows = cursor.fetchall()
+                columns = [col[0] for col in cursor.description]
+                docs = [dict(zip(columns, row)) for row in rows]
+                if docs:
+                    target_db = self.client[target_db_name]
+                    target_collection = target_db[table_name]
+                    target_collection.insert_many(docs)
+        except Exception as e:
+            logging.error(f"CDC failed for {source_db_name}.{table_name}: {e}")
+
+    def run(self):
+        """Main loop to continuously pick and process chunks concurrently."""
+        logging.info(f"Worker {self.worker_id} started.")
+        with ThreadPoolExecutor(max_workers=MaxWorkerThreads) as executor:
+            try:
+                while True:
+                    chunk = self.assign_chunk()
+                    if chunk:
+                        executor.submit(self.migrate_chunk, chunk)
+                    else:
+                        time.sleep(WorkerPollInterval)
+            except KeyboardInterrupt:
+                logging.info(f"Worker {self.worker_id} shutting down...")
+
 
 if __name__ == "__main__":
     import argparse
