@@ -46,3 +46,7 @@ MaxWorkerThreads = 5          # Number of threads per worker for concurrent chun
 # Optional: Logging Level Override
 # ----------------------------
 # LoggingLevel = logging.INFO
+
+# Add new configuration values
+MaxPoolSize = 100
+MetricsPort = 9090

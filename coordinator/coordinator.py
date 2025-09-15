@@ -1,52 +1,106 @@
 # coordinator/coordinator.py
 
+import asyncio
 import logging
-import time
 import signal
 import sys
-from pymongo import MongoClient
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Dict, Optional
+from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
+from prometheus_client import Counter, Gauge, start_http_server
 from tenacity import retry, stop_after_attempt, wait_fixed
-from worker.worker import Worker  # Import Worker to use capture_cdc
+import structlog
 from config.config import (
     MongoUri, MetaDb, DatabaseMappings, DefaultBatchSize,
-    MaxRetries, WorkerPollInterval, CdcPollInterval
+    MaxRetries, WorkerPollInterval, CdcPollInterval, MaxPoolSize, MetricsPort
 )
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure structured logging
+logger = structlog.get_logger()
 
-# Collection names
-DataChunksCollection = "DataChunks"
-MigrationStatusCollection = "MigrationStatus"
+# Configure metrics
+start_http_server(MetricsPort)
 
-# Signal handler for graceful shutdown
-def handle_exit(signal, frame):
-    logging.info("Coordinator shutting down gracefully...")
-    sys.exit(0)
+@dataclass
+class MigrationProgress:
+    total_chunks: int
+    completed_chunks: int
+    failed_chunks: int
+    start_time: datetime
+    last_updated: datetime
 
-signal.signal(signal.SIGINT, handle_exit)
-signal.signal(signal.SIGTERM, handle_exit)
+    def calculate_progress(self) -> float:
+        return (self.completed_chunks / self.total_chunks) * 100 if self.total_chunks > 0 else 0
 
+def circuit_breaker(failure_threshold: int = 3, reset_timeout: int = 60):
+    def decorator(func):
+        failures = 0
+        last_failure_time = None
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            nonlocal failures, last_failure_time
+            if failures >= failure_threshold:
+                if datetime.now() - last_failure_time < timedelta(seconds=reset_timeout):
+                    raise Exception("Circuit breaker open")
+                failures = 0
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                failures += 1
+                last_failure_time = datetime.now()
+                raise
+        return wrapper
+    return decorator
 
 class Coordinator:
-    def __init__(self, client: MongoClient = None):
-        """Initialize the Coordinator with MongoDB client."""
-        self.client = client or MongoClient(MongoUri)
+    def __init__(self, client: AsyncIOMotorClient = None):
+        self.client = client or AsyncIOMotorClient(MongoUri, maxPoolSize=MaxPoolSize)
         self.db = self.client[MetaDb]
         self.data_chunks = self.db[DataChunksCollection]
         self.migration_status = self.db[MigrationStatusCollection]
+        self.logger = logger.bind(component="coordinator")
+        
+        # Metrics
+        self.chunks_created = Counter('chunks_created_total', 'Total chunks created')
+        self.chunks_completed = Counter('chunks_completed_total', 'Total chunks completed')
+        self.migration_progress = Gauge('migration_progress_percent', 'Migration progress')
+
+    async def check_health(self) -> bool:
+        try:
+            await self.client.admin.command('ping')
+            return True
+        except Exception as e:
+            self.logger.error("health_check_failed", error=str(e))
+            return False
+
+    def validate_configuration(self):
+        required_configs = ['MongoUri', 'MetaDb', 'DatabaseMappings']
+        for config in required_configs:
+            if not globals().get(config):
+                raise ValueError(f"Missing required configuration: {config}")
 
     def validate_inputs(self, source_db: str, target_db: str, table_name: str, total_rows: int):
         if not source_db or not target_db or not table_name:
-            raise ValueError("SourceDb, TargetDb, and TableName must be provided.")
+            raise ValueError("SourceDb, TargetDb, and TableName must be provided")
         if total_rows <= 0:
-            raise ValueError(f"Invalid total_rows value: {total_rows} for table {table_name}.")
+            raise ValueError(f"Invalid total_rows value: {total_rows} for table {table_name}")
 
-    def split_table_into_chunks(self, source_db: str, target_db: str, table_name: str, total_rows: int,
-                                pk_column: str, batch_size: int = DefaultBatchSize, dry_run=False):
+    @circuit_breaker()
+    async def split_table_into_chunks(
+        self, 
+        source_db: str, 
+        target_db: str, 
+        table_name: str, 
+        total_rows: int,
+        pk_column: str, 
+        batch_size: int = DefaultBatchSize, 
+        dry_run: bool = False
+    ):
         self.validate_inputs(source_db, target_db, table_name, total_rows)
-
+        
         chunks = [
             {
                 "SourceDb": source_db,
@@ -55,133 +109,91 @@ class Coordinator:
                 "PrimaryKey": pk_column,
                 "StartId": start_id,
                 "EndId": min(start_id + batch_size - 1, total_rows),
-                "LastProcessedId": None,
                 "Status": "Pending",
                 "AssignedWorker": None,
                 "RetryCount": 0,
-                "LastProcessedTimestamp": None
+                "LastUpdated": datetime.utcnow()
             }
             for start_id in range(1, total_rows + 1, batch_size)
         ]
 
         if dry_run:
-            logging.info(f"[DRY-RUN] Would insert {len(chunks)} chunks for {source_db}.{table_name} → {target_db}.")
+            self.logger.info(
+                "dry_run_chunks_created",
+                source_db=source_db,
+                target_db=target_db,
+                table_name=table_name,
+                chunk_count=len(chunks)
+            )
             return
 
-        if chunks:
-            try:
-                self.data_chunks.insert_many(chunks, ordered=False)
-                logging.info(f"Inserted {len(chunks)} chunks for {source_db}.{table_name} → {target_db}")
-            except PyMongoError as e:
-                logging.error(f"Failed to insert chunks for {source_db}.{table_name}: {e}")
-                raise
-
-    @retry(stop=stop_after_attempt(MaxRetries), wait=wait_fixed(2))
-    def mark_migration_state(self, migration_id: str, state: str):
         try:
-            self.migration_status.update_one(
-                {"MigrationId": migration_id},
-                {"$set": {"State": state, "LastUpdated": time.time()}},
-                upsert=True
+            await self.data_chunks.insert_many(chunks)
+            self.chunks_created.inc(len(chunks))
+            self.logger.info(
+                "chunks_created",
+                source_db=source_db,
+                target_db=target_db,
+                table_name=table_name,
+                chunk_count=len(chunks)
             )
-            logging.info(f"Migration state updated to '{state}' for migration ID '{migration_id}'.")
         except PyMongoError as e:
-            logging.error(f"Failed to update migration state for migration ID '{migration_id}': {e}")
+            self.logger.error(
+                "chunk_creation_failed",
+                source_db=source_db,
+                target_db=target_db,
+                table_name=table_name,
+                error=str(e)
+            )
             raise
 
-    def get_tables_from_oracle(self, source_db: str) -> dict:
-        """Stub: fetch table names, row counts, and primary keys from Oracle database."""
-        return {
-            "EMPLOYEES": {"TotalRows": 100000, "PrimaryKey": "EMP_ID"},
-            "DEPARTMENTS": {"TotalRows": 500, "PrimaryKey": "DEPT_ID"}
-        }
+    async def cleanup_stale_chunks(self, max_age_hours: int = 24):
+        stale_threshold = datetime.utcnow() - timedelta(hours=max_age_hours)
+        result = await self.data_chunks.update_many(
+            {
+                "Status": "InProgress",
+                "LastUpdated": {"$lt": stale_threshold}
+            },
+            {"$set": {"Status": "Pending", "AssignedWorker": None}}
+        )
+        self.logger.info("stale_chunks_reset", count=result.modified_count)
 
-    def generate_chunks_for_all_databases(self, dry_run=False):
-        for mapping in DatabaseMappings:
-            source_db = mapping["SourceDb"]
-            target_db = mapping["TargetDb"]
-            tables = self.get_tables_from_oracle(source_db)
-            for table_name, table_info in tables.items():
-                self.split_table_into_chunks(
-                    source_db,
-                    target_db,
-                    table_name,
-                    table_info["TotalRows"],
-                    pk_column=table_info["PrimaryKey"],
-                    dry_run=dry_run
-                )
+    async def recover_failed_chunks(self):
+        result = await self.data_chunks.update_many(
+            {"Status": "Failed", "RetryCount": {"$lt": MaxRetries}},
+            {"$set": {"Status": "Pending"}, "$inc": {"RetryCount": 1}}
+        )
+        self.logger.info("failed_chunks_recovered", count=result.modified_count)
+        return result.modified_count
 
-    def run_cdc(self):
-        """Continuously capture incremental changes for all tables until cutover."""
-        worker = Worker("CDCWorker", client=self.client)
-        logging.info("Starting CDC polling loop...")
-
-        while True:
-            for mapping in DatabaseMappings:
-                source_db = mapping["SourceDb"]
-                target_db = mapping["TargetDb"]
-                tables = self.get_tables_from_oracle(source_db)
-                for table_name in tables.keys():
-                    # Get last sync timestamp for resumability
-                    last_sync_doc = self.db["DataChunks"].find_one(
-                        {"SourceDb": source_db, "TableName": table_name},
-                        sort=[("LastProcessedTimestamp", -1)]
-                    )
-                    last_sync_time = last_sync_doc["LastProcessedTimestamp"] if last_sync_doc else "1970-01-01 00:00:00"
-                    worker.capture_cdc(table_name, source_db, target_db, last_sync_time)
-
-            time.sleep(CdcPollInterval)
-
-    def run(self, dry_run=False):
-        """Main coordinator loop."""
-        migration_id = "migration_001"
-        logging.info("Coordinator started.")
-
-        # Mark migration in progress
-        self.mark_migration_state(migration_id, "InProgress")
-
-        # Generate chunks if not already present
-        if self.data_chunks.count_documents({}) == 0:
-            logging.info("Generating migration chunks...")
-            self.generate_chunks_for_all_databases(dry_run=dry_run)
-        else:
-            logging.info("Chunks already exist; resuming migration...")
-
-        if dry_run:
-            logging.info("[DRY-RUN] Exiting without making changes.")
+    async def run(self, dry_run: bool = False):
+        self.validate_configuration()
+        
+        if not await self.check_health():
+            self.logger.error("coordinator_startup_failed")
             return
 
-        # Start CDC polling in parallel
-        import threading
-        cdc_thread = threading.Thread(target=self.run_cdc, daemon=True)
-        cdc_thread.start()
-
-        # Monitor chunk progress
         try:
             while True:
-                pending_count = self.data_chunks.count_documents({"Status": "Pending"})
-                inprogress_count = self.data_chunks.count_documents({"Status": "InProgress"})
-                logging.info(f"Migration Status: Pending={pending_count}, InProgress={inprogress_count}")
+                await self.cleanup_stale_chunks()
+                await self.recover_failed_chunks()
+                
+                # Update progress metrics
+                total_chunks = await self.data_chunks.count_documents({})
+                completed_chunks = await self.data_chunks.count_documents({"Status": "Completed"})
+                self.migration_progress.set((completed_chunks / total_chunks * 100) if total_chunks > 0 else 0)
 
-                if pending_count == 0 and inprogress_count == 0:
-                    logging.info("All chunks processed. Migration ready for cutover.")
-                    self.mark_migration_state(migration_id, "CutoverPending")
-                    break
-
-                time.sleep(WorkerPollInterval)
-
-            logging.info("Coordinator exiting. Migration ready for final cutover.")
+                await asyncio.sleep(WorkerPollInterval)
 
         except KeyboardInterrupt:
-            logging.info("Coordinator interrupted. Exiting...")
-
+            self.logger.info("coordinator_shutting_down")
+            await self.client.close()
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Start the migration coordinator.")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate operations without making changes.")
+    parser = argparse.ArgumentParser(description="Start the migration coordinator")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate operations without making changes")
     args = parser.parse_args()
 
-    coordinator = Coordinator()
-    coordinator.run(dry_run=args.dry_run)
+    asyncio.run(Coordinator().run(dry_run=args.dry_run))
