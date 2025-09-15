@@ -2,21 +2,19 @@
 
 import asyncio
 import logging
-import signal
-import sys
+import certifi
 from functools import wraps
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
-from typing import Dict, Optional
-import structlog
-from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
+from pymongo import AsyncMongoClient
 from prometheus_client import Counter, Gauge, start_http_server
 from tenacity import retry, stop_after_attempt, wait_fixed
 from config.config import (
     MongoUri, MetaDb, DatabaseMappings, DefaultBatchSize,
-    MaxRetries, WorkerPollInterval, MetricsPort
+    MaxRetries, WorkerPollInterval, MetricsPort, MaxPoolSize
 )
+import structlog
 
 # Collection names
 DataChunksCollection = "DataChunks"
@@ -48,34 +46,39 @@ def circuit_breaker(failure_threshold: int = 3, reset_timeout: int = 60):
         async def wrapper(*args, **kwargs):
             nonlocal failures, last_failure_time
             if failures >= failure_threshold:
-                if datetime.now() - last_failure_time < timedelta(seconds=reset_timeout):
+                if datetime.now(timezone.utc) - last_failure_time < timedelta(seconds=reset_timeout):
                     raise Exception("Circuit breaker open")
                 failures = 0
             try:
                 return await func(*args, **kwargs)
-            except Exception as e:
+            except Exception:
                 failures += 1
-                last_failure_time = datetime.now()
+                last_failure_time = datetime.now(timezone.utc)
                 raise
         return wrapper
     return decorator
 
 class Coordinator:
-    # Class-level metrics to ensure single registration
     _metrics_initialized = False
     _chunks_created = None
     _chunks_completed = None
     _migration_progress = None
 
-    def __init__(self, client: AsyncIOMotorClient = None):
-        """Initialize the Coordinator with MongoDB client."""
-        self.client = client or AsyncIOMotorClient(MongoUri, maxPoolSize=MaxPoolSize)
+    def __init__(self, client: AsyncMongoClient = None):
+        """Initialize Coordinator with async MongoDB client."""
+        self.client = client or AsyncMongoClient(
+            MongoUri,
+            maxPoolSize=MaxPoolSize,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=60000,
+            connectTimeoutMS=60000
+        )
         self.db = self.client[MetaDb]
         self.data_chunks = self.db[DataChunksCollection]
         self.migration_status = self.db[MigrationStatusCollection]
         self.logger = logger.bind(component="coordinator")
-        
-        # Initialize metrics only once
+
         if not Coordinator._metrics_initialized:
             Coordinator._chunks_created = Counter(
                 'migration_chunks_created_total',
@@ -90,8 +93,7 @@ class Coordinator:
                 'Current migration progress as a percentage'
             )
             Coordinator._metrics_initialized = True
-        
-        # Instance-level references to class metrics
+
         self.chunks_created = self._chunks_created
         self.chunks_completed = self._chunks_completed
         self.migration_progress = self._migration_progress
@@ -118,17 +120,16 @@ class Coordinator:
 
     @circuit_breaker()
     async def split_table_into_chunks(
-        self, 
-        source_db: str, 
-        target_db: str, 
-        table_name: str, 
+        self,
+        source_db: str,
+        target_db: str,
+        table_name: str,
         total_rows: int,
-        pk_column: str, 
-        batch_size: int = DefaultBatchSize, 
+        pk_column: str,
+        batch_size: int = DefaultBatchSize,
         dry_run: bool = False
     ):
         self.validate_inputs(source_db, target_db, table_name, total_rows)
-        
         chunks = [
             {
                 "SourceDb": source_db,
@@ -140,7 +141,7 @@ class Coordinator:
                 "Status": "Pending",
                 "AssignedWorker": None,
                 "RetryCount": 0,
-                "LastUpdated": datetime.now(timezone.utc)  # Updated to use timezone-aware datetime
+                "LastUpdated": datetime.now(timezone.utc)
             }
             for start_id in range(1, total_rows + 1, batch_size)
         ]
@@ -176,7 +177,6 @@ class Coordinator:
             raise
 
     async def cleanup_stale_chunks(self, max_age_hours: int = 24):
-        """Clean up stale chunks that have been in progress for too long."""
         stale_threshold = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         result = await self.data_chunks.update_many(
             {
@@ -196,48 +196,18 @@ class Coordinator:
         return result.modified_count
 
     async def mark_migration_state(self, migration_id: str, state: str) -> None:
-        """
-        Mark the state of a migration in the status collection.
-        
-        Args:
-            migration_id: Unique identifier for the migration
-            state: Current state of the migration (e.g., 'Pending', 'InProgress', 'Completed', 'Failed')
-        """
         try:
             await self.migration_status.update_one(
                 {"_id": migration_id},
-                {
-                    "$set": {
-                        "Status": state,
-                        "LastUpdated": datetime.now(timezone.utc)
-                    }
-                },
+                {"$set": {"Status": state, "LastUpdated": datetime.now(timezone.utc)}},
                 upsert=True
             )
-            self.logger.info(
-                "migration_state_updated",
-                migration_id=migration_id,
-                state=state
-            )
+            self.logger.info("migration_state_updated", migration_id=migration_id, state=state)
         except PyMongoError as e:
-            self.logger.error(
-                "migration_state_update_failed",
-                migration_id=migration_id,
-                state=state,
-                error=str(e)
-            )
+            self.logger.error("migration_state_update_failed", migration_id=migration_id, state=state, error=str(e))
             raise
 
     async def get_migration_progress(self, migration_id: str) -> dict:
-        """
-        Get the progress of a migration.
-        
-        Args:
-            migration_id: Unique identifier for the migration
-            
-        Returns:
-            dict: Migration progress details including total chunks, completed chunks, and status
-        """
         try:
             total_chunks = await self.data_chunks.count_documents({"MigrationId": migration_id})
             completed_chunks = await self.data_chunks.count_documents({
@@ -245,7 +215,6 @@ class Coordinator:
                 "Status": "Completed"
             })
             status = await self.migration_status.find_one({"_id": migration_id})
-            
             return {
                 "migration_id": migration_id,
                 "total_chunks": total_chunks,
@@ -254,16 +223,12 @@ class Coordinator:
                 "progress": (completed_chunks / total_chunks * 100) if total_chunks > 0 else 0
             }
         except PyMongoError as e:
-            self.logger.error(
-                "get_migration_progress_failed",
-                migration_id=migration_id,
-                error=str(e)
-            )
+            self.logger.error("get_migration_progress_failed", migration_id=migration_id, error=str(e))
             raise
 
     async def run(self, dry_run: bool = False):
         self.validate_configuration()
-        
+
         if not await self.check_health():
             self.logger.error("coordinator_startup_failed")
             return
@@ -272,12 +237,9 @@ class Coordinator:
             while True:
                 await self.cleanup_stale_chunks()
                 await self.recover_failed_chunks()
-                
-                # Update progress metrics
                 total_chunks = await self.data_chunks.count_documents({})
                 completed_chunks = await self.data_chunks.count_documents({"Status": "Completed"})
                 self.migration_progress.set((completed_chunks / total_chunks * 100) if total_chunks > 0 else 0)
-
                 await asyncio.sleep(WorkerPollInterval)
 
         except KeyboardInterrupt:
