@@ -68,10 +68,10 @@ The system includes the following components:
 2. **Set up Python environment**
 
   ```bash
-  python -m venv venv
-  source venv/bin/activate
-  pip install -r requirements.txt
-
+   python -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+  ```
 3. **Configure MongoDB**
 
    - Set up a replica set or standalone instance with write concern enabled.
@@ -94,7 +94,8 @@ The system includes the following components:
 
   ```bash
    python worker.py
-
+   ```
+   
 3. **Monitor progress**
 
   - Use logs and MongoDB queries to track chunk processing, retries, and change log status.
