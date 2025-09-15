@@ -1,68 +1,48 @@
 # config/config.py
 
-import logging
-from logging.handlers import RotatingFileHandler
+# ----------------------------
+# MongoDB Connection Settings
+# ----------------------------
+MongoUri = "mongodb://localhost:27017"   # MongoDB URI
+MetaDb = "metadata"                       # Central metadata database
 
-# ---------------------------
-# MongoDB Configuration
-# ---------------------------
-MongoUri = "mongodb://localhost:27017"
-
-# Metadata database (central store for tracking migration progress)
-MetaDb = "MigrationMetadata"
-
-# List of target databases corresponding to each Oracle DB
+# ----------------------------
+# Oracle Databases Configuration
+# ----------------------------
+# Example structure for multiple source Oracle DBs
 DatabaseMappings = [
     {
-        "SourceDb": "OracleDB1",
-        "TargetDb": "MongoTargetDB1"
+        "SourceDb": "ORACLE_DB1",
+        "TargetDb": "MONGO_DB1",
+        "Dsn": "oracle_host1:1521/ORCL",  # host:port/service_name
+        "User": "oracle_user1",
+        "Password": "oracle_password1",
+        "PrimaryKey": "ID"                 # Primary key column used for chunking
     },
     {
-        "SourceDb": "OracleDB2",
-        "TargetDb": "MongoTargetDB2"
+        "SourceDb": "ORACLE_DB2",
+        "TargetDb": "MONGO_DB2",
+        "Dsn": "oracle_host2:1521/ORCL",
+        "User": "oracle_user2",
+        "Password": "oracle_password2",
+        "PrimaryKey": "EMP_ID"
     }
 ]
 
-# ---------------------------
-# Oracle Databases Configuration
-# ---------------------------
-OracleDatabases = [
-    {
-        "Name": "OracleDB1",
-        "User": "user1",
-        "Password": "password1",
-        "Dsn": "host1:1521/DB1"
-    },
-    {
-        "Name": "OracleDB2",
-        "User": "user2",
-        "Password": "password2",
-        "Dsn": "host2:1521/DB2"
-    }
-]
-
-# ---------------------------
+# ----------------------------
 # Migration Settings
-# ---------------------------
-DefaultBatchSize = 1000       # Rows per batch
-MaxRetries = 3                # Max retries for failed chunks
-WorkerPollInterval = 5        # Seconds between worker polls for tasks
-ChangeCaptureInterval = 10    # Seconds between polling Oracle for CDC
+# ----------------------------
+DefaultBatchSize = 10000      # Number of rows per chunk
+MaxRetries = 3                # Max retries per chunk or migration state update
+WorkerPollInterval = 5        # Seconds between checking for pending chunks
+CdcPollInterval = 10          # Seconds between incremental CDC polling
 
-# ---------------------------
-# Logging Configuration
-# ---------------------------
-LogFilePath = "migration.log"
-LogLevel = logging.INFO
+# ----------------------------
+# Worker Settings
+# ----------------------------
+MaxWorkerThreads = 5          # Number of threads per worker for concurrent chunk processing
 
-Logger = logging.getLogger("MigrationLogger")
-Logger.setLevel(LogLevel)
-
-FileHandler = RotatingFileHandler(LogFilePath, maxBytes=5*1024*1024, backupCount=5)
-Formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-FileHandler.setFormatter(Formatter)
-Logger.addHandler(FileHandler)
-
-ConsoleHandler = logging.StreamHandler()
-ConsoleHandler.setFormatter(Formatter)
-Logger.addHandler(ConsoleHandler)
+# ----------------------------
+# Optional: Logging Level Override
+# ----------------------------
+# LoggingLevel = logging.INFO
