@@ -1,13 +1,18 @@
+cffi==2.0.0
+cryptography==45.0.7
 dnspython==2.8.0
 iniconfig==2.1.0
 motor==3.7.1
--e git+https://github.com/chaturvedi-prateek/oracle-to-mongodb-migrator.git@5123450fed0b151c35483c263e0becc0555bfac1#egg=oracle_to_mongodb_migrator
+oracle-to-mongodb-migrator==0.1
+oracledb==3.3.0
 packaging==25.0
 pluggy==1.6.0
 prometheus_client==0.22.1
+pycparser==2.23
 Pygments==2.19.2
 pymongo==4.15.0
 pytest==8.4.2
 pytest-asyncio==1.2.0
+pytest-mock==3.15.0
 structlog==25.4.0
 tenacity==9.1.2
