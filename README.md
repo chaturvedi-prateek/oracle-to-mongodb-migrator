@@ -64,7 +64,8 @@ The system includes the following components:
    ```bash
    git clone https://github.com/chaturvedi-prateek/oracle-to-mongodb-migrator.git
    cd oracle-to-mongodb-migrator
-
+   ```
+   
 2. **Set up Python environment**
 
   ```bash
@@ -89,7 +90,8 @@ The system includes the following components:
 
    ```bash
    python coordinator.py
-
+   ```
+   
 2. **Start one or more Worker processes**
 
   ```bash
