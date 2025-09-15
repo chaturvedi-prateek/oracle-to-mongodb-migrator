@@ -4,18 +4,23 @@ import asyncio
 import logging
 import signal
 import sys
-from datetime import datetime, timedelta
+from functools import wraps
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Dict, Optional
+import structlog
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 from prometheus_client import Counter, Gauge, start_http_server
 from tenacity import retry, stop_after_attempt, wait_fixed
-import structlog
 from config.config import (
     MongoUri, MetaDb, DatabaseMappings, DefaultBatchSize,
-    MaxRetries, WorkerPollInterval, CdcPollInterval, MaxPoolSize, MetricsPort
+    MaxRetries, WorkerPollInterval, MetricsPort
 )
+
+# Collection names
+DataChunksCollection = "DataChunks"
+MigrationStatusCollection = "MigrationStatus"
 
 # Configure structured logging
 logger = structlog.get_logger()
@@ -56,17 +61,40 @@ def circuit_breaker(failure_threshold: int = 3, reset_timeout: int = 60):
     return decorator
 
 class Coordinator:
+    # Class-level metrics to ensure single registration
+    _metrics_initialized = False
+    _chunks_created = None
+    _chunks_completed = None
+    _migration_progress = None
+
     def __init__(self, client: AsyncIOMotorClient = None):
+        """Initialize the Coordinator with MongoDB client."""
         self.client = client or AsyncIOMotorClient(MongoUri, maxPoolSize=MaxPoolSize)
         self.db = self.client[MetaDb]
         self.data_chunks = self.db[DataChunksCollection]
         self.migration_status = self.db[MigrationStatusCollection]
         self.logger = logger.bind(component="coordinator")
         
-        # Metrics
-        self.chunks_created = Counter('chunks_created_total', 'Total chunks created')
-        self.chunks_completed = Counter('chunks_completed_total', 'Total chunks completed')
-        self.migration_progress = Gauge('migration_progress_percent', 'Migration progress')
+        # Initialize metrics only once
+        if not Coordinator._metrics_initialized:
+            Coordinator._chunks_created = Counter(
+                'migration_chunks_created_total',
+                'Total number of migration chunks created'
+            )
+            Coordinator._chunks_completed = Counter(
+                'migration_chunks_completed_total',
+                'Total number of migration chunks completed'
+            )
+            Coordinator._migration_progress = Gauge(
+                'migration_progress_percentage',
+                'Current migration progress as a percentage'
+            )
+            Coordinator._metrics_initialized = True
+        
+        # Instance-level references to class metrics
+        self.chunks_created = self._chunks_created
+        self.chunks_completed = self._chunks_completed
+        self.migration_progress = self._migration_progress
 
     async def check_health(self) -> bool:
         try:
@@ -112,7 +140,7 @@ class Coordinator:
                 "Status": "Pending",
                 "AssignedWorker": None,
                 "RetryCount": 0,
-                "LastUpdated": datetime.utcnow()
+                "LastUpdated": datetime.now(timezone.utc)  # Updated to use timezone-aware datetime
             }
             for start_id in range(1, total_rows + 1, batch_size)
         ]
@@ -148,7 +176,8 @@ class Coordinator:
             raise
 
     async def cleanup_stale_chunks(self, max_age_hours: int = 24):
-        stale_threshold = datetime.utcnow() - timedelta(hours=max_age_hours)
+        """Clean up stale chunks that have been in progress for too long."""
+        stale_threshold = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         result = await self.data_chunks.update_many(
             {
                 "Status": "InProgress",
@@ -165,6 +194,72 @@ class Coordinator:
         )
         self.logger.info("failed_chunks_recovered", count=result.modified_count)
         return result.modified_count
+
+    async def mark_migration_state(self, migration_id: str, state: str) -> None:
+        """
+        Mark the state of a migration in the status collection.
+        
+        Args:
+            migration_id: Unique identifier for the migration
+            state: Current state of the migration (e.g., 'Pending', 'InProgress', 'Completed', 'Failed')
+        """
+        try:
+            await self.migration_status.update_one(
+                {"_id": migration_id},
+                {
+                    "$set": {
+                        "Status": state,
+                        "LastUpdated": datetime.now(timezone.utc)
+                    }
+                },
+                upsert=True
+            )
+            self.logger.info(
+                "migration_state_updated",
+                migration_id=migration_id,
+                state=state
+            )
+        except PyMongoError as e:
+            self.logger.error(
+                "migration_state_update_failed",
+                migration_id=migration_id,
+                state=state,
+                error=str(e)
+            )
+            raise
+
+    async def get_migration_progress(self, migration_id: str) -> dict:
+        """
+        Get the progress of a migration.
+        
+        Args:
+            migration_id: Unique identifier for the migration
+            
+        Returns:
+            dict: Migration progress details including total chunks, completed chunks, and status
+        """
+        try:
+            total_chunks = await self.data_chunks.count_documents({"MigrationId": migration_id})
+            completed_chunks = await self.data_chunks.count_documents({
+                "MigrationId": migration_id,
+                "Status": "Completed"
+            })
+            status = await self.migration_status.find_one({"_id": migration_id})
+            
+            return {
+                "migration_id": migration_id,
+                "total_chunks": total_chunks,
+                "completed_chunks": completed_chunks,
+                "status": status.get("Status") if status else "Unknown",
+                "progress": (completed_chunks / total_chunks * 100) if total_chunks > 0 else 0
+            }
+        except PyMongoError as e:
+            self.logger.error(
+                "get_migration_progress_failed",
+                migration_id=migration_id,
+                error=str(e)
+            )
+            raise
 
     async def run(self, dry_run: bool = False):
         self.validate_configuration()
