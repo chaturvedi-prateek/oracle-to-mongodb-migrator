@@ -5,15 +5,17 @@ import time
 import signal
 import sys
 import certifi
-from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+from pymongo.client_session import ClientSession
+from pymongo import AsyncMongoClient
 import oracledb  # Replacing cx_Oracle with oracledb
 from bson import ObjectId
 from tenacity import retry, stop_after_attempt, wait_fixed
 from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from config.config import (
     MongoUri, MetaDb, DatabaseMappings, DefaultBatchSize,
-    MaxRetries, WorkerPollInterval, MaxWorkerThreads
+    MaxRetries, WorkerPollInterval, MaxWorkerThreads, MaxPoolSize
 )
 
 # Configure logging
@@ -32,20 +34,28 @@ signal.signal(signal.SIGTERM, handle_exit)
 
 
 class Worker:
-    def __init__(self, worker_id: str, client: MongoClient = None):
+    def __init__(self, worker_id: str, client: AsyncMongoClient = None):
         """Initialize the Worker with a unique ID and MongoDB client."""
         self.worker_id = worker_id
-        self.client = client or MongoClient(MongoUri, tls=True,
-                        tlsCAFile=certifi.where())
-        self.meta_db = self.client[MetaDb]
-        self.data_chunks = self.meta_db[DataChunksCollection]
+        self.client = client or AsyncMongoClient(
+            MongoUri,
+            maxPoolSize=MaxPoolSize,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=60000,
+            connectTimeoutMS=60000
+        )
+        self.meta_db = self.client.get_database(MetaDb)
+        self.data_chunks = self.meta_db.get_collection(DataChunksCollection)
+        self.logger = logging.getLogger("worker")
 
-    def assign_chunk(self):
+    async def assign_chunk(self):
         """Atomically assign the next pending chunk to this worker."""
         try:
-            chunk = self.data_chunks.find_one_and_update(
+            chunk = await self.data_chunks.find_one_and_update(
                 {"Status": "Pending", "RetryCount": {"$lt": MaxRetries}},
                 {"$set": {"Status": "InProgress", "AssignedWorker": self.worker_id}},
+                return_document=True
             )
             if not chunk:
                 logging.info(f"No pending chunks available for Worker {self.worker_id}.")
@@ -54,19 +64,19 @@ class Worker:
             logging.error(f"Worker {self.worker_id} failed to assign a chunk: {e}")
             return None
 
-    def mark_chunk_completed(self, chunk_id: ObjectId):
+    async def mark_chunk_completed(self, chunk_id: ObjectId):
         """Mark chunk as completed."""
         try:
-            result = self.data_chunks.update_one({"_id": chunk_id}, {"$set": {"Status": "Completed"}})
+            result = await self.data_chunks.update_one({"_id": chunk_id}, {"$set": {"Status": "Completed"}})
             if result.modified_count == 0:
                 logging.warning(f"No chunk found with ID {chunk_id} to mark as completed.")
         except PyMongoError as e:
             logging.error(f"Failed to mark chunk {chunk_id} as completed: {e}")
 
-    def mark_chunk_failed(self, chunk_id: ObjectId):
+    async def mark_chunk_failed(self, chunk_id: ObjectId):
         """Mark chunk as failed and increment retry count."""
         try:
-            self.data_chunks.update_one(
+            await self.data_chunks.update_one(
                 {"_id": chunk_id},
                 {"$set": {"Status": "Pending", "AssignedWorker": None}, "$inc": {"RetryCount": 1}}
             )
@@ -82,32 +92,27 @@ class Worker:
         start_id = chunk["StartId"]
         end_id = chunk["EndId"]
 
-        # Get Oracle connection info
         source_db_info = next((db for db in DatabaseMappings if db["SourceDb"] == source_db_name), None)
         if not source_db_info:
             logging.error(f"No Oracle DB info for {source_db_name}")
-            self.mark_chunk_failed(chunk["_id"])
+            asyncio.run(self.mark_chunk_failed(chunk["_id"]))
             return
 
         try:
-            # Connect to Oracle using oracledb
             with oracledb.connect(
                 user=source_db_info["User"],
                 password=source_db_info["Password"],
                 dsn=source_db_info["Dsn"]
             ) as conn:
                 cursor = conn.cursor()
-
-                # Use primary key for efficient chunking
                 pk_column = source_db_info.get("PrimaryKey", "ID")
                 query = f"SELECT * FROM {table_name} WHERE {pk_column} >= :start_id AND {pk_column} <= :end_id"
                 cursor.execute(query, {"start_id": start_id, "end_id": end_id})
                 rows = cursor.fetchall()
                 columns = [col[0] for col in cursor.description]
 
-                # Insert into MongoDB
-                target_db = self.client[target_db_name]
-                target_collection = target_db[table_name]
+                target_db = self.client.get_database(target_db_name)
+                target_collection = target_db.get_collection(table_name)
                 docs = [dict(zip(columns, row)) for row in rows]
                 if docs:
                     start_time = time.time()
@@ -116,14 +121,13 @@ class Worker:
                     logging.info(f"Worker {self.worker_id} migrated {len(docs)} rows in {duration:.2f}s "
                                  f"for {source_db_name}.{table_name} (StartId: {start_id}, EndId: {end_id})")
 
-            self.mark_chunk_completed(chunk["_id"])
+            asyncio.run(self.mark_chunk_completed(chunk["_id"]))
 
         except Exception as e:
             logging.error(f"Worker {self.worker_id} failed chunk {chunk['_id']} for {source_db_name}.{table_name}: {e}")
-            self.mark_chunk_failed(chunk["_id"])
+            asyncio.run(self.mark_chunk_failed(chunk["_id"]))
 
     def capture_cdc(self, table_name: str, source_db_name: str, target_db_name: str, last_sync_time: str):
-        """Poll Oracle for incremental changes since last_sync_time."""
         source_db_info = next((db for db in DatabaseMappings if db["SourceDb"] == source_db_name), None)
         if not source_db_info:
             logging.error(f"No Oracle DB info for {source_db_name} in CDC")
@@ -142,15 +146,34 @@ class Worker:
                 columns = [col[0] for col in cursor.description]
                 docs = [dict(zip(columns, row)) for row in rows]
                 if docs:
-                    target_db = self.client[target_db_name]
-                    target_collection = target_db[table_name]
+                    target_db = self.client.get_database(target_db_name)
+                    target_collection = target_db.get_collection(table_name)
                     target_collection.insert_many(docs)
         except Exception as e:
             logging.error(f"CDC failed for {source_db_name}.{table_name}: {e}")
 
-    def run(self):
+    async def wait_for_coordinator(self, max_retries=10, delay=5):
+        """Wait for the coordinator to create initial migration status."""
+        for attempt in range(max_retries):
+            self.logger.info(f"Checking if coordinator is ready (attempt {attempt + 1})")
+            status = await self.meta_db["MigrationStatus"].find_one({"_id": "initial_migration_id"})
+            if status:
+                self.logger.info("Coordinator is ready")
+                return True
+            self.logger.warning("Coordinator not ready, retrying...")
+            await asyncio.sleep(delay)
+        raise Exception("Coordinator not ready after retries")
+
+    async def run(self):
         """Main loop to continuously pick and process chunks concurrently."""
-        logging.info(f"Worker {self.worker_id} started.")
+        try:
+            # Wait for coordinator to be ready before starting
+            await self.wait_for_coordinator(max_retries=10, delay=5)
+        except Exception as e:
+            self.logger.error(f"Could not start: {e}")
+            return
+
+        self.logger.info(f"Worker {self.worker_id} started after coordinator ready.")
         with ThreadPoolExecutor(max_workers=MaxWorkerThreads) as executor:
             try:
                 while True:
@@ -158,10 +181,11 @@ class Worker:
                     if chunk:
                         executor.submit(self.migrate_chunk, chunk)
                     else:
-                        time.sleep(WorkerPollInterval)
-            except KeyboardInterrupt:
-                logging.info(f"Worker {self.worker_id} shutting down...")
-
+                        await asyncio.sleep(WorkerPollInterval)  # non-blocking sleep
+            except asyncio.CancelledError:
+                self.logger.info(f"Worker {self.worker_id} cancelled and stopping...")
+            except Exception as e:
+                self.logger.error(f"Worker {self.worker_id} encountered an error: {e}")
 
 if __name__ == "__main__":
     import argparse
@@ -171,4 +195,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     worker = Worker(args.worker_id)
-    worker.run()
+    asyncio.run(worker.run())

@@ -1,15 +1,21 @@
 # metadata/createCollections.py
 
-import os
 import json
 import logging
-import signal
 import sys
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import CollectionInvalid, PyMongoError
+import signal
 from typing import List, Dict
+from pymongo.errors import CollectionInvalid, PyMongoError
+from pymongo import ASCENDING
+from pymongo import WriteConcern
+from pymongo.client_session import ClientSession
+from pymongo.collection import Collection
+from pymongo.database import Database
+from pymongo.mongo_client import AsyncMongoClient
 from tenacity import retry, stop_after_attempt, wait_fixed
-from config import MongoUri, MetadataDb  # Importing from your config.py
+from config.config import MongoUri, MetadataDb  # Importing from your config.py
+import certifi
+import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -19,18 +25,19 @@ DATA_CHUNKS_COLLECTION = "DataChunks"
 CHANGE_LOG_COLLECTION = "ChangeLog"
 
 # Signal handler for graceful shutdown
-def handle_exit(signal, frame):
+def handle_exit(signal_num, frame):
     logging.info("Shutting down gracefully...")
     sys.exit(0)
 
 signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
 
 def validate_config():
     """Validate MongoDB configuration."""
     if not MongoUri or not MetadataDb:
         raise ValueError("MongoUri or MetadataDb is not configured properly.")
 
-def load_index_definitions(file_path: str) -> Dict[str, List[Dict]]:
+async def load_index_definitions(file_path: str) -> Dict[str, List[Dict]]:
     """Load index definitions from a JSON file."""
     try:
         with open(file_path, "r") as file:
@@ -51,13 +58,13 @@ def validate_index_definitions(index_definitions: Dict[str, List[Dict]]):
                 raise ValueError(f"Invalid index definition for collection '{collection}': {index}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def create_collection(db, collection_name: str, dry_run=False):
+async def create_collection(db: Database, collection_name: str, dry_run=False):
     """Create a MongoDB collection if it doesn't already exist."""
     if dry_run:
         logging.info(f"[DRY-RUN] Would create collection '{collection_name}' in database '{db.name}'.")
         return
     try:
-        db.create_collection(collection_name)
+        await db.create_collection(collection_name)
         logging.info(f"Collection '{collection_name}' created in database '{db.name}'.")
     except CollectionInvalid:
         logging.info(f"Collection '{collection_name}' already exists in database '{db.name}'.")
@@ -65,38 +72,37 @@ def create_collection(db, collection_name: str, dry_run=False):
         logging.error(f"Error creating collection '{collection_name}': {e}")
         raise
 
-def create_indexes(collection, indexes: List[Dict], dry_run=False):
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+async def create_indexes(collection: Collection, indexes: List[Dict], dry_run=False):
     """Create indexes for a MongoDB collection."""
     for index in indexes:
         if dry_run:
             logging.info(f"[DRY-RUN] Would create index {index['fields']} for collection '{collection.name}'.")
             continue
         try:
-            collection.create_index(index["fields"], unique=index.get("unique", False))
+            await collection.create_index(index["fields"], unique=index.get("unique", False))
             logging.info(f"Index {index['fields']} created for collection '{collection.name}'.")
         except PyMongoError as e:
             logging.error(f"Failed to create index {index['fields']} for collection '{collection.name}': {e}")
             raise
 
-def check_mongo_connection(client: MongoClient):
+async def check_mongo_connection(client: AsyncMongoClient):
     """Check if the MongoDB server is reachable."""
     try:
-        client.admin.command("ping")
+        await client.admin.command("ping")
         logging.info("MongoDB connection successful.")
     except PyMongoError as e:
         logging.error(f"MongoDB connection failed: {e}")
         raise
 
-def setup_metadata_collections(db, index_definitions, dry_run=False):
+async def setup_metadata_collections(db: Database, index_definitions: Dict[str, List[Dict]], dry_run=False):
     """Set up metadata collections and their indexes in MongoDB."""
     try:
-        # Create and index DataChunks collection
-        create_collection(db, DATA_CHUNKS_COLLECTION, dry_run=dry_run)
-        create_indexes(db[DATA_CHUNKS_COLLECTION], index_definitions[DATA_CHUNKS_COLLECTION], dry_run=dry_run)
+        await create_collection(db, DATA_CHUNKS_COLLECTION, dry_run=dry_run)
+        await create_indexes(db[DATA_CHUNKS_COLLECTION], index_definitions.get(DATA_CHUNKS_COLLECTION, []), dry_run=dry_run)
 
-        # Create and index ChangeLog collection
-        create_collection(db, CHANGE_LOG_COLLECTION, dry_run=dry_run)
-        create_indexes(db[CHANGE_LOG_COLLECTION], index_definitions[CHANGE_LOG_COLLECTION], dry_run=dry_run)
+        await create_collection(db, CHANGE_LOG_COLLECTION, dry_run=dry_run)
+        await create_indexes(db[CHANGE_LOG_COLLECTION], index_definitions.get(CHANGE_LOG_COLLECTION, []), dry_run=dry_run)
 
         logging.info("MongoDB metadata setup complete.")
     except ValueError as e:
@@ -106,34 +112,32 @@ def setup_metadata_collections(db, index_definitions, dry_run=False):
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
 
-def generate_summary_report(created_collections, created_indexes):
-    """Generate a summary report of the collections and indexes created."""
-    logging.info("Summary Report:")
-    logging.info(f"Collections created: {created_collections}")
-    logging.info(f"Indexes created: {created_indexes}")
+async def create_metadata(dry_run=False, index_file="index_definitions.json"):
+    """Main entry point to create metadata collections."""
+    validate_config()
+    index_definitions = await load_index_definitions(index_file)
+    validate_index_definitions(index_definitions)
+
+    client = AsyncMongoClient(
+        MongoUri,
+        tls=True,
+        tlsCAFile=certifi.where(),
+        serverSelectionTimeoutMS=60000,
+        connectTimeoutMS=60000
+    )
+
+    await check_mongo_connection(client)
+    db = client[MetadataDb]
+    await setup_metadata_collections(db, index_definitions, dry_run=dry_run)
+    await client.close()
+    logging.info("Metadata creation process completed.")
 
 if __name__ == "__main__":
-    # Parse command-line arguments
     import argparse
 
     parser = argparse.ArgumentParser(description="Setup MongoDB metadata collections.")
-    parser.add_argument("--uri", type=str, help="MongoDB URI", default=MongoUri)
-    parser.add_argument("--db", type=str, help="Metadata database name", default=MetadataDb)
     parser.add_argument("--dry-run", action="store_true", help="Simulate the operations without making changes.")
-    parser.add_argument("--index-file", type=str, help="Path to the index definitions file.", default="index_definitions.json")
+    parser.add_argument("--index-file", type=str, default="index_definitions.json", help="Path to index definitions file.")
     args = parser.parse_args()
 
-    try:
-        validate_config()
-        index_definitions = load_index_definitions(args.index_file)
-        validate_index_definitions(index_definitions)
-
-        with MongoClient(args.uri) as client:
-            check_mongo_connection(client)
-            db = client[args.db]
-            setup_metadata_collections(db, index_definitions, dry_run=args.dry_run)
-
-        if not args.dry_run:
-            generate_summary_report([DATA_CHUNKS_COLLECTION, CHANGE_LOG_COLLECTION], index_definitions.keys())
-    except Exception as e:
-        logging.error(f"Failed to set up metadata collections: {e}")
+    asyncio.run(create_metadata(dry_run=args.dry_run, index_file=args.index_file))
